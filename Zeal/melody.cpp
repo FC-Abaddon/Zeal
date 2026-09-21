@@ -427,8 +427,8 @@ Melody::Melody(ZealService *zeal) {
           return true;
         }
 
-        if (args.size() > 6) {
-          Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "A melody can only consist of up to 5 songs.");
+        if (args.size() > 25) {
+          Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "A melody can only consist of up to 25 songs.");
           return true;
         }
 
