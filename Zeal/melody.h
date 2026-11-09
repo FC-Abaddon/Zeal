@@ -44,6 +44,10 @@ class Melody {
   bool handle_opcode(int opcode, char *buffer, UINT len);
   bool activate_use_item();
   void dump() const;
+  void clear_cast_tracking();       // Retires the casting and (matching) deferred spell ids.
+  bool caster_cast_completed();     // True if the in-flight non-bard cast reached the end of its timer.
+  bool update_caster_state(ULONGLONG current_timestamp);  // Returns true if casting is suppressed this tick.
+  int cheapest_song_mana();         // Mana cost of the least expensive song in the list (0 if unknown).
 
   bool is_active = false;                          // Set when melody is actively running.
   bool is_verbose = false;                         // Emits extra chat spam messages (debug).
@@ -60,4 +64,17 @@ class Melody {
   ULONGLONG enter_zone_time = 0;                   // Timestamp of the most recent enter zone callback.
   ULONGLONG casting_visible_timestamp = 0;         // Timestamps to add minimum delay after casting ends
   ULONGLONG start_of_cast_timestamp = 0;           // and to detect excessive retries.
+
+  // Non-bard (caster) melody state. All of this is inert while is_caster_melody is false.
+  bool is_caster_melody = false;         // Set in start() for any class other than bard.
+  int caster_state = 0;                  // CasterState::Casting or ::Meditating.
+  bool meditate_seated = false;          // False while meditating mounted (regen w/out sitting).
+  ULONGLONG melody_start_time = 0;       // Start of melody, for the maximum duration limit.
+  ULONGLONG meditate_start_time = 0;     // Time the meditating state was entered.
+  ULONGLONG meditate_progress_time = 0;  // Last time mana was observed increasing while meditating.
+  ULONGLONG stand_detected_time = 0;     // First tick the player was seen standing while meditating.
+  ULONGLONG last_cast_end_time = 0;      // Completion time of the last cast, for the recovery delay.
+  short meditate_peak_mana = 0;          // Highest mana seen during the current meditate.
+  unsigned int last_cast_recovery_ms = 0;  // Recovery (global cooldown) of the last completed cast.
+  bool debug_logging = false;              // '/melody debug' dumps the stop cast handshake state.
 };

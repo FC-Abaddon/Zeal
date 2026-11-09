@@ -15,6 +15,15 @@
 // - 5 song limit
 // - Retries allowed on missed notes
 // - Character stuns must end melody
+//
+// Non-bard (caster) melody:
+// Bard songs cost no mana, ignore the global cooldown, and survive movement, so the bard loop can
+// just cycle forever. Casters can not, so a caster melody runs a two state machine:
+// - Casting: cycles the gem list like a bard until mana drops below MELODY_MEDITATE_MANA_PCT.
+// - Meditating: sits and waits for the 6 second server ticks until mana reaches
+//   MELODY_RESUME_MANA_PCT, then stands back up and returns to casting.
+// A caster melody also self terminates after MELODY_CASTER_MAX_DURATION_MS. All of the caster
+// behavior is gated behind is_caster_melody so the bard path is unchanged.
 
 // Test cases:
 // - Command line behavior and messages:
@@ -43,7 +52,17 @@ constexpr unsigned int MELODY_WAIT_USE_ITEM_TIMEOUT = 500;  // Wait time after u
 constexpr unsigned int USE_ITEM_QUEUE_TIMEOUT =
     3650;  // Max duration a useitem will stay queued for before giving up (mostly to prevent ultra-stale clicks).
 
+// Non-bard (caster) melody tuning.
+constexpr float MELODY_MEDITATE_MANA_PCT = 0.20f;  // Sit and meditate below this fraction of max mana.
+constexpr float MELODY_RESUME_MANA_PCT = 0.95f;    // Stand and resume casting at or above this fraction.
+constexpr ULONGLONG MELODY_CASTER_MAX_DURATION_MS = 30 * 60 * 1000;  // Caster melodies stop after 30 minutes.
+constexpr ULONGLONG MELODY_MEDITATE_NO_PROGRESS_MS =
+    60 * 1000;  // End the melody if mana stops regenerating for this long (~10 server ticks).
+constexpr unsigned int MELODY_CASTER_RECOVERY_MS = 2500;  // Fallback global cooldown when the spell has no recovery.
+constexpr unsigned int MELODY_STAND_GRACE_MS = 500;  // A stand must persist this long to end a meditate.
+
 enum UseItemState : int { Idle = 0, CastRequested, CastStarted };
+enum CasterState : int { Casting = 0, Meditating };
 
 // Parses the token argument to configure the melody step object.
 MelodyStep::MelodyStep(const std::string &token) {
@@ -128,8 +147,16 @@ bool Melody::start(const std::vector<MelodyStep> &new_songs, bool resume) {
     return false;
   }
 
+  const bool caster_melody = (char_info->Class != Zeal::GameEnums::ClassTypes::Bard);
+  if (caster_melody && char_info->max_mana() <= 0) {
+    Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "Only classes with a mana pool can keep a melody.");
+    return false;
+  }
+
+  // A caster melody may also start while sitting since it drops into the meditating state.
   Zeal::GameStructures::Entity *self = Zeal::Game::get_self();
-  if (!self || (self->StandingState != Stance::Stand)) {
+  const bool sitting = self && (self->StandingState == Stance::Sit);
+  if (!self || ((self->StandingState != Stance::Stand) && !(caster_melody && sitting))) {
     Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "Can only start melody when standing.");
     return false;
   }
@@ -181,6 +208,28 @@ bool Melody::start(const std::vector<MelodyStep> &new_songs, bool resume) {
   deferred_spell_id = kInvalidSpellId;
   use_item_index = -1;
   // Do not reset use_item_ack_state in case this is an aligned melody re-start.
+  casting_visible_timestamp = GetTickCount64();
+  start_of_cast_timestamp = casting_visible_timestamp;
+
+  // Caster state. A resume keeps the original start time so it can not extend the duration limit.
+  is_caster_melody = caster_melody;
+  if (!resume) melody_start_time = GetTickCount64();
+  caster_state = CasterState::Casting;
+  meditate_seated = false;
+  meditate_start_time = 0;
+  meditate_progress_time = 0;
+  stand_detected_time = 0;
+  last_cast_end_time = 0;
+  last_cast_recovery_ms = 0;
+  meditate_peak_mana = 0;
+  if (is_active && is_caster_melody && sitting) {
+    caster_state = CasterState::Meditating;  // Already sitting, so start out meditating.
+    meditate_seated = true;
+    meditate_start_time = GetTickCount64();
+    meditate_progress_time = meditate_start_time;
+    meditate_peak_mana = char_info->mana();
+  }
+
   if (is_active) Zeal::Game::print_chat(USERCOLOR_SPELLS, "You begin playing a melody.");
   return true;
 }
@@ -214,6 +263,16 @@ void Melody::end(bool do_print, bool full_stop) {
     // Do not reset the use_item_ack_state (could be in the middle of a clicky cast) unless a full stop.
     if (full_stop) use_item_ack_state = UseItemState::Idle;
 
+    caster_state = CasterState::Casting;
+    meditate_seated = false;
+    meditate_start_time = 0;
+    meditate_progress_time = 0;
+    stand_detected_time = 0;
+    last_cast_end_time = 0;
+    last_cast_recovery_ms = 0;
+    meditate_peak_mana = 0;
+    casting_visible_timestamp = GetTickCount64();
+    start_of_cast_timestamp = casting_visible_timestamp;
     if (do_print) Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "Your melody has ended.");
   }
 }
@@ -226,7 +285,59 @@ bool Melody::use_item(int item_index) {
   return true;
 }
 
+// Retires the in-flight song and, if it matches, the deferred song. These must be cleared together
+// or get_next_gem_index() will keep returning the stale deferred gem forever.
+void Melody::clear_cast_tracking() {
+  if (casting_melody_spell_id == deferred_spell_id) deferred_spell_id = kInvalidSpellId;
+  casting_melody_spell_id = kInvalidSpellId;
+}
+
+// Returns true if the in-flight non-bard cast had already reached the end of its cast timer, which
+// means this stop is the normal end-of-cast teardown rather than an interruption. Two independent
+// checks are used because the relative ordering of the server's OP_MemorizeSpell (sets the gem
+// number to 0xff) and OP_ManaChange (triggers StopSpellCast) is not guaranteed. This must be called
+// from the StopCast detour, which runs before the original, so the casting state is still intact.
+bool Melody::caster_cast_completed() {
+  Zeal::GameStructures::Entity *self = Zeal::Game::get_self();
+  auto *actor_info = self ? self->ActorInfo : nullptr;
+  auto *display = Zeal::Game::get_display();
+  if (!actor_info || !display) return false;
+
+  if (actor_info->CastingSpellGemNumber == 0xff) return true;  // Server acked the end of the cast timer.
+  // Signed difference so a GameTimeMs wraparound does not report a false completion.
+  return actor_info->CastingTimeout != 0 &&
+         static_cast<int>(display->GameTimeMs - actor_info->CastingTimeout) >= 0;
+}
+
 void Melody::handle_stop_cast_callback(BYTE reason, WORD spell_id) {
+  // A caster's successful cast also ends with a StopSpellCast (from the server's OP_ManaChange), so
+  // the reason code can not be used to tell success from failure here. Interruptions are instead fed
+  // into the existing retry logic and RETRY_COUNT_END_LIMIT remains the only runaway backstop. This
+  // path never ends the melody because casters get interrupted by ordinary gameplay.
+  if (is_active && is_caster_melody) {
+    if (debug_logging) {
+      Zeal::GameStructures::Entity *self = Zeal::Game::get_self();
+      auto *actor_info = self ? self->ActorInfo : nullptr;
+      auto *display = Zeal::Game::get_display();
+      Zeal::Game::print_chat("Melody dbg: reason %i spell %i gem 0x%02x cast_to %i now %i -> %s", reason, spell_id,
+                             actor_info ? actor_info->CastingSpellGemNumber : 0,
+                             actor_info ? actor_info->CastingTimeout : 0, display ? display->GameTimeMs : 0,
+                             caster_cast_completed() ? "complete" : "interrupted");
+    }
+
+    if (caster_cast_completed()) {
+      clear_cast_tracking();
+      retry_count = 0;  // Confirmed progress. Needed for instant cast spells that never show a cast bar.
+      last_cast_end_time = GetTickCount64();
+      return;
+    }
+
+    if (casting_melody_spell_id == spell_id && (++retry_count % RETRY_COUNT_REWIND_LIMIT))
+      retry_spell_id = casting_melody_spell_id;
+    casting_melody_spell_id = kInvalidSpellId;
+    return;
+  }
+
   // Terminate melody on stop except for missed note (part of reason == 3) rewind attempts.
   // Server SendSpellBarEnable() calls generate OP_ManaChange packets with reason = 3.
   // This is called by the server's CastedSpellFinished() for non-bard song clickies and by
@@ -301,6 +412,135 @@ static void stop_current_song_quietly() {
   Zeal::Game::send_message(OP_ManaChange, nullptr, 0, 1);  // Stops the bard song on server.
 }
 
+// Returns the mana cost of the least expensive song in the list (0 if it can not be determined).
+// The cheapest song is used instead of the next song because get_next_gem_index() mutates state
+// and so can not be used to peek ahead.
+int Melody::cheapest_song_mana() {
+  auto *char_info = Zeal::Game::get_char_info();
+  auto *spell_mgr = Zeal::Game::get_spell_mgr();
+  if (!char_info || !spell_mgr) return 0;
+
+  int cheapest = 0;
+  for (const auto &step : songs) {
+    if (!step.is_gem()) continue;
+    const int gem_index = step.gem;
+    if (gem_index < 0 || gem_index >= GAME_NUM_SPELL_GEMS) continue;
+    int spell_id = char_info->MemorizedSpell[gem_index];
+    if (spell_id <= 0 || spell_id >= GAME_NUM_SPELLS) continue;
+    const auto *spell_info = spell_mgr->Spells[spell_id];
+    if (!spell_info) continue;
+    if (cheapest == 0 || spell_info->Mana < cheapest) cheapest = spell_info->Mana;
+  }
+  return cheapest;
+}
+
+// Runs the casting / meditating state machine for non-bard melodies. Returns true if casting should
+// be suppressed this tick (either because we are meditating or because a stance change needs a tick
+// to settle). Must be called after the in-flight cast checks and before the standing check so that
+// meditating is not blocked by the player sitting.
+bool Melody::update_caster_state(ULONGLONG current_timestamp) {
+  Zeal::GameStructures::Entity *self = Zeal::Game::get_self();
+  auto *char_info = Zeal::Game::get_char_info();
+  if (!self || !char_info) return false;
+
+  const short current_mana = char_info->mana();
+  const short max_mana = char_info->max_mana();
+  if (max_mana <= 0) return false;  // Should be blocked at start(), but never divide by zero.
+  const float mana_fraction = static_cast<float>(current_mana) / max_mana;
+
+  if (caster_state == CasterState::Casting) {
+    // A queued clicky takes priority over dropping into a meditate.
+    if (use_item_index >= 0) return false;
+
+    // A manual sit is treated as a request to meditate now, regardless of the mana level. It is
+    // ignored at full mana so we don't immediately stand the player back up and fight them for it.
+    const bool manual_sit = (self->StandingState == Stance::Sit) && (mana_fraction < MELODY_RESUME_MANA_PCT);
+    const int cheapest_mana = cheapest_song_mana();
+    if (!manual_sit && mana_fraction >= MELODY_MEDITATE_MANA_PCT &&
+        (cheapest_mana == 0 || current_mana >= cheapest_mana))
+      return false;  // Plenty of mana, keep casting.
+
+    if (!manual_sit) {
+      // Mounted characters already regenerate at the seated rate, so meditate without sitting.
+      if (Zeal::Game::is_mounted()) {
+        meditate_seated = false;
+      } else {
+        Zeal::Game::sit();  // ChangeStance() applies immediately, so the result can be read back.
+        if (self->StandingState != Stance::Sit) {
+          // sit() refused. It is a no-op while mezzed, which also blocks casting, so just wait it
+          // out. Anything else (feigned, dead, not in control) is handled by the tick() terminations.
+          return true;
+        }
+        meditate_seated = true;
+      }
+    } else {
+      meditate_seated = true;
+    }
+
+    caster_state = CasterState::Meditating;
+    meditate_start_time = current_timestamp;
+    meditate_progress_time = current_timestamp;
+    meditate_peak_mana = current_mana;
+    stand_detected_time = 0;
+    Zeal::Game::print_chat(USERCOLOR_SPELLS, "Melody: mana at %d%%, meditating until %d%%.",
+                           static_cast<int>(mana_fraction * 100), static_cast<int>(MELODY_RESUME_MANA_PCT * 100));
+    return true;
+  }
+
+  // Meditating.
+  // A queued clicky has to stand us back up to be cast, otherwise it just silently expires against
+  // USE_ITEM_QUEUE_TIMEOUT. Drop back to casting; the casting branch defers the mana check while a
+  // clicky is pending, so the meditate resumes on the tick after it fires.
+  if (use_item_index >= 0) {
+    if (meditate_seated) self->ChangeStance(Stance::Stand);
+    caster_state = CasterState::Casting;
+    meditate_seated = false;
+    stand_detected_time = 0;
+    casting_visible_timestamp = current_timestamp;
+    start_of_cast_timestamp = current_timestamp;
+    return true;  // Let the stance change settle.
+  }
+
+  // Standing back up is the manual override. Require it to persist to avoid transient races.
+  if (meditate_seated && self->StandingState != Stance::Sit) {
+    if (!stand_detected_time) stand_detected_time = current_timestamp;
+    if ((current_timestamp - stand_detected_time) > MELODY_STAND_GRACE_MS) {
+      end(true);
+      return true;
+    }
+    return true;
+  }
+  stand_detected_time = 0;
+
+  if (current_mana > meditate_peak_mana) {  // Mana is still coming in.
+    meditate_peak_mana = current_mana;
+    meditate_progress_time = current_timestamp;
+  }
+
+  if (mana_fraction >= MELODY_RESUME_MANA_PCT) {
+    if (meditate_seated) self->ChangeStance(Stance::Stand);
+    caster_state = CasterState::Casting;
+    meditate_seated = false;
+    stand_detected_time = 0;
+    casting_visible_timestamp = current_timestamp;  // Stale after a long meditate.
+    start_of_cast_timestamp = current_timestamp;
+    last_cast_end_time = 0;  // The recovery delay has long since elapsed.
+    Zeal::Game::print_chat(USERCOLOR_SPELLS, "Melody: mana at %d%%, resuming.",
+                           static_cast<int>(mana_fraction * 100));
+    return true;  // Let the stance change settle before casting.
+  }
+
+  if ((current_timestamp - meditate_progress_time) > MELODY_MEDITATE_NO_PROGRESS_MS) {
+    const bool needs_food = (char_info->Hunger == 0 || char_info->Thirst == 0);
+    Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "Melody: mana is not regenerating%s.",
+                           needs_food ? " (check your food and drink)" : "");
+    end(true);
+    return true;
+  }
+
+  return true;
+}
+
 void Melody::tick() {
   if (!is_active) return;
 
@@ -308,13 +548,27 @@ void Melody::tick() {
   Zeal::GameStructures::GAMECHARINFO *char_info = Zeal::Game::get_char_info();
 
   // Handle various reasons to terminate Zeal automatically.
-  if (!Zeal::Game::is_in_game() || !self || !self->ActorInfo || !char_info || (self->StandingState == Stance::Sit) ||
+  // A caster melody sits to meditate, so sitting is handled by the state machine instead. The
+  // stances that sitting was implicitly covering for it are terminated explicitly.
+  const bool stance_terminate =
+      is_caster_melody ? (self && (self->StandingState == Stance::Dead || self->StandingState == Stance::Feign ||
+                                   self->StandingState == Stance::NotInControl))
+                       : (self && self->StandingState == Stance::Sit);
+  if (!Zeal::Game::is_in_game() || !self || !self->ActorInfo || !char_info || stance_terminate ||
       (char_info->StunnedState) || (retry_count > RETRY_COUNT_END_LIMIT)) {
     end(true);
     return;
   }
 
   ULONGLONG current_timestamp = GetTickCount64();
+
+  // Caster melodies self terminate so an unattended one can not run forever.
+  if (is_caster_melody && melody_start_time && (current_timestamp - melody_start_time) > MELODY_CASTER_MAX_DURATION_MS) {
+    Zeal::Game::print_chat(USERCOLOR_SPELLS, "Melody: %d minute limit reached.",
+                           static_cast<int>(MELODY_CASTER_MAX_DURATION_MS / 60000));
+    end(true);
+    return;
+  }
 
   // Pause updates from start of zoning until a small delay after entering to let things stabilize.
   if (!enter_zone_time || current_timestamp < enter_zone_time + MELODY_ZONE_IN_DELAY) return;
@@ -339,8 +593,7 @@ void Melody::tick() {
   // Either casting finished normally or the retry logic has already kicked in,
   // so resetting the casting and deferred spell ids prevents the song from repeating
   // after this point.
-  if (casting_melody_spell_id == deferred_spell_id) deferred_spell_id = kInvalidSpellId;
-  casting_melody_spell_id = kInvalidSpellId;
+  clear_cast_tracking();
 
   // Notes on client / server handshaking:
   // (1) Bard song gem casts:
@@ -374,10 +627,15 @@ void Melody::tick() {
   // These are the simplest since there is no server handshaking and no server/client
   // state to get out of sync, so Melody just sends the item cast request and moves on
   // to the next song step.
+  // (5) Non-bard gem casts:
+  // The OP_MemorizeSpell gem number ack still arrives, but unlike a bard there is no steady state
+  // song afterwards: CastingSpellId stays valid until the server's OP_ManaChange runs
+  // StopSpellCast(). Treating 0xff as "ready" would therefore stop a cast the server already
+  // resolved, so for casters the readiness test is CastingSpellId going invalid.
 
   // The timeouts are for debug reporting and recovery if something goes wrong.
   bool casting_active = self->ActorInfo->CastingSpellId != kInvalidSpellId;
-  bool server_ack_cast = (self->ActorInfo->CastingSpellGemNumber == 0xff);
+  bool server_ack_cast = is_caster_melody ? false : (self->ActorInfo->CastingSpellGemNumber == 0xff);
   if (casting_active && !server_ack_cast) {
     bool use_item_active = (use_item_ack_state != UseItemState::Idle);
     unsigned int timeout = use_item_active ? MELODY_WAIT_USE_ITEM_TIMEOUT : MELODY_WAIT_TIMEOUT;
@@ -390,6 +648,11 @@ void Melody::tick() {
     }
   }
 
+  // Run the caster casting / meditating state machine. This has to happen after the checks above
+  // (never change stance with a cast in flight or a server ack pending) but before the standing
+  // check below, which would otherwise block all processing while seated and meditating.
+  if (is_caster_melody && update_caster_state(current_timestamp)) return;
+
   // Handles situations like trade windows, looting (Stance::Bind), and ducking.
   if (!Zeal::Game::get_game() || !Zeal::Game::get_game()->IsOkToTransact() || self->StandingState != Stance::Stand)
     return;
@@ -398,17 +661,30 @@ void Melody::tick() {
   use_item_ack_state = UseItemState::Idle;
   if (activate_use_item()) return;
 
+  // Non-bard spells have a global cooldown (spell recovery) after a cast completes. Casting inside
+  // of it just fails, so wait it out here rather than burning retries on it. The ActorInfo
+  // FizzleTimeout can't be used since StopSpellCast() zeroes it before this can read it.
+  if (is_caster_melody && last_cast_end_time) {
+    unsigned int recovery_ms = last_cast_recovery_ms ? last_cast_recovery_ms : MELODY_CASTER_RECOVERY_MS;
+    if (current_timestamp < (last_cast_end_time + recovery_ms)) return;  // Note: no retry_count increment.
+    last_cast_end_time = 0;
+  }
+
   int current_gem = get_next_gem_index();
   if (current_gem < 0) return;  // Either the next song wasn't ready (possibly deferred) or activated an item.
   WORD current_gem_spell_id = char_info->MemorizedSpell[current_gem];
   if (current_gem_spell_id == kInvalidSpellId) return;  // simply skip empty gem slots (unexpected to occur)
 
+  auto *spell_mgr = Zeal::Game::get_spell_mgr();
+  const Zeal::GameStructures::SPELL *current_spell =
+      (spell_mgr && current_gem_spell_id > 0 && current_gem_spell_id < GAME_NUM_SPELLS)
+          ? spell_mgr->Spells[current_gem_spell_id]
+          : nullptr;
+
   // handle a common issue of no target gracefully (notify once and skip to next song w/out retry failures).
-  if (Zeal::Game::get_spell_mgr() &&
-      (Zeal::Game::get_spell_mgr()->Spells[current_gem_spell_id]->TargetType ==
-           Zeal::GameEnums::SpellTargetType::Target ||
-       Zeal::Game::get_spell_mgr()->Spells[current_gem_spell_id]->TargetType ==
-           Zeal::GameEnums::SpellTargetType::TargetedAE) &&
+  if (current_spell &&
+      (current_spell->TargetType == Zeal::GameEnums::SpellTargetType::Target ||
+       current_spell->TargetType == Zeal::GameEnums::SpellTargetType::TargetedAE) &&
       !Zeal::Game::get_target()) {
     Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "You must first select a target for spell %i", current_gem + 1);
     retry_count++;  // Re-use the retry logic to limit runaway spam if entire song list is target-based.
@@ -420,10 +696,13 @@ void Melody::tick() {
   else
     stop_current_cast();  // Just in case call. Does nothing if casting not active (expected).
 
-  if (char_info->cast(current_gem, current_gem_spell_id, 0, -1))
+  if (char_info->cast(current_gem, current_gem_spell_id, 0, -1)) {
     casting_melody_spell_id = current_gem_spell_id;  // Successful start of cast; arm retry.
-  else
+    // Stashed now since the spell id is no longer available when the cast completes.
+    last_cast_recovery_ms = current_spell ? current_spell->FizzleTime : 0;
+  } else {
     retry_count++;  // Re-use the retry logic to limit runaway spam if entire song list is invalid.
+  }
 
   start_of_cast_timestamp = current_timestamp;
 }
@@ -493,7 +772,7 @@ int Melody::get_next_gem_index() {
   }
 
   // Then check if there is already a deferred song.
-  if (char_info && deferred_spell_id) {
+  if (char_info && deferred_spell_id != kInvalidSpellId) {
     for (const auto &step : songs)
       if (!step.is_item() && char_info->MemorizedSpell[step.gem] == deferred_spell_id && is_gem_ready(step.gem))
         return step.gem;
@@ -527,12 +806,24 @@ int Melody::get_next_gem_index() {
 void Melody::handle_deactivate_ui() {
   enter_zone_time = 0;  // Pauses melody processing loop
 
-  // Bail out if melody not active (bard or not) and if not a bard singing a song.
-  if (!is_active || !Zeal::Game::GameInternal::IsPlayerABardAndSingingASong()) return;
+  if (!is_active) return;
+  Zeal::GameStructures::Entity *self = Zeal::Game::get_self();
+  if (!self || !self->ActorInfo) return;
+
+  // Standing state is wiped by zoning, so a caster that zones while meditating would come back
+  // standing and trip the manual override. Reset to casting and let the mana check re-enter.
+  caster_state = CasterState::Casting;
+  meditate_seated = false;
+  stand_detected_time = 0;
+
+  // Bail out if not a bard singing a song and not a caster with a cast in flight. The caster case
+  // has to be checked here since IsPlayerABardAndSingingASong() is always false for them.
+  const bool caster_casting = is_caster_melody && (self->ActorInfo->CastingSpellId != kInvalidSpellId);
+  if (!Zeal::Game::GameInternal::IsPlayerABardAndSingingASong() && !caster_casting) return;
 
   // Re-use the interrupted logic to rewind melody to cleanly continue after zone in.
   // CastingSpellId must be valid to have gotten here.
-  handle_stop_cast_callback(3, Zeal::Game::get_self()->ActorInfo->CastingSpellId);
+  handle_stop_cast_callback(3, self->ActorInfo->CastingSpellId);
 }
 
 // Extra server handshake tracking for clicky casts. The OP_BeginCast packet is used to
@@ -609,7 +900,8 @@ Melody::Melody(ZealService *zeal) {
   zeal->hooks->Add("StopCast", 0x4cb510, StopCast, hook_type_detour);  // Hook in to end melody as well.
   zeal->commands_hook->Add(
       "/melody", {"/mel"},
-      "Bard only, auto cycles up to 5 songs or bard song item clicks (0.10, 2.3, Case_sensitive_name_search).",
+      "Auto cycles up to 5 songs or bard song item clicks (bards), or spell gems 1-8 (other mana classes). "
+      "Item clicks: 0.10, 2.3, Case_sensitive_name_search.",
       [this](std::vector<std::string> &args) {
         if (args.size() > 1 && args[1] == "resume") {
           resume();  // Continues an interrupted melody.
@@ -626,15 +918,28 @@ Melody::Melody(ZealService *zeal) {
           return true;
         }
 
-        end(true, false);  // otherwise any active melodies are always terminated
-
-        if (!Zeal::Game::get_char_info() || Zeal::Game::get_char_info()->Class != Zeal::GameEnums::ClassTypes::Bard) {
-          Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "Only bards can keep a melody.");
+        if (args.size() == 2 && args[1] == "debug") {
+          debug_logging = !debug_logging;  // Dumps the non-bard stop cast handshake state.
+          Zeal::Game::print_chat("Melody debug logging %s", debug_logging ? "enabled" : "disabled");
           return true;
         }
 
-        if (args.size() > 25) {
-          Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "A melody can only consist of up to 25 songs.");
+        end(true, false);  // otherwise any active melodies are always terminated
+
+        auto *char_info = Zeal::Game::get_char_info();
+        if (!char_info) return true;
+
+        // Bards rotate their gem bar so they can list more songs than they have gems.
+        const bool is_bard = (char_info->Class == Zeal::GameEnums::ClassTypes::Bard);
+        if (!is_bard && char_info->max_mana() <= 0) {
+          Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "Only classes with a mana pool can keep a melody.");
+          return true;
+        }
+
+        const size_t max_args = is_bard ? 25 : (GAME_NUM_SPELL_GEMS + 1);
+        if (args.size() > max_args) {
+          Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "A melody can only consist of up to %i songs.",
+                                 static_cast<int>(max_args - 1));
           return true;
         }
 
@@ -642,6 +947,10 @@ Melody::Melody(ZealService *zeal) {
         for (size_t i = 1; i < args.size(); i++)  // start at argument 1 because 0 is the command itself
         {
           MelodyStep step(args[i]);
+          if (!is_bard && step.is_item()) {
+            Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "Only spell gems 1-8 can be used as non-bard songs.");
+            return true;
+          }
           if (!step.is_valid(true)) {
             Zeal::Game::print_chat(USERCOLOR_SPELL_FAILURE, "Melody example: /melody 1 2 3 0.10 Composers_Chestplate");
             Zeal::Game::print_chat(
